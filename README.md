@@ -10,6 +10,15 @@ Features
     🎲 Secure password generator
     📴 Local-first, offline-focused design
 
+
+Download link:
+
+<p align="center">
+  <a href="https://github.com/mohamedbennour31/Velora/releases/download/v1.0.0/Velora-Setup.exe">
+    <img src="https://img.shields.io/badge/Download-Velora%20for%20Windows-brightgreen?style=for-the-badge&logo=windows" alt="Download Velora for Windows" />
+  </a>
+</p>
+
 !Velora Welcome Screen
 
 <img src="screenshots/1.png" >
@@ -23,7 +32,7 @@ Features
 <img src="screenshots/3.png" >
 <!-- Add screenshot of the password generator here -->
 
-Download Velora-Setup.exe from this repository's Releases or repository files, then run the installer.
+
 
 Built With
 
