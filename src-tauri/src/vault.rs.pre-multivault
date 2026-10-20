@@ -1,0 +1,403 @@
+use argon2::{Algorithm, Argon2, Params, Version};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chacha20poly1305::{
+aead::{Aead, KeyInit},
+ChaCha20Poly1305, Nonce,
+};
+use rand::{rngs::OsRng, RngCore};
+use serde::{Deserialize, Serialize};
+use std::{
+fs::{self, OpenOptions},
+io::Write,
+path::PathBuf,
+sync::{Mutex, OnceLock},
+};
+use zeroize::Zeroize;
+
+const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 12;
+
+static SESSION_KEY: OnceLock<Mutex<Option<[u8; 32]>>> = OnceLock::new();
+
+fn session() -> &'static Mutex<Option<[u8; 32]>> {
+SESSION_KEY.get_or_init(|| Mutex::new(None))
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Entry {
+pub id: String,
+pub title: String,
+pub username: String,
+pub password: String,
+pub url: String,
+pub notes: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VaultData {
+entries: Vec<Entry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VaultFile {
+version: u32,
+master_salt: String,
+master_nonce: String,
+master_wrapped_key: String,
+recovery_salt: String,
+recovery_nonce: String,
+recovery_wrapped_key: String,
+data_nonce: String,
+data_ciphertext: String,
+}
+
+fn vault_path() -> Result<PathBuf, String> {
+let base = std::env::var_os("APPDATA")
+.map(PathBuf::from)
+.ok_or("Application data directory unavailable")?;
+let dir = base.join("Velora");
+fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+Ok(dir.join("vault.json"))
+}
+
+fn encode(data: &[u8]) -> String {
+URL_SAFE_NO_PAD.encode(data)
+}
+
+fn decode(data: &str) -> Result<Vec<u8>, String> {
+URL_SAFE_NO_PAD.decode(data)
+.map_err(|_| "Invalid vault encoding".into())
+}
+
+fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+let params = Params::new(65536, 3, 1, Some(32))
+.map_err(|e| e.to_string())?;
+let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+let mut key = [0u8; 32];
+argon.hash_password_into(password.as_bytes(), salt, &mut key)
+.map_err(|e| e.to_string())?;
+Ok(key)
+}
+
+fn encrypt(key: &[u8; 32], plaintext: &[u8])
+-> Result<(Vec<u8>, Vec<u8>), String>
+{
+let cipher = ChaCha20Poly1305::new_from_slice(key)
+.map_err(|e| e.to_string())?;
+let mut nonce = [0u8; NONCE_LEN];
+OsRng.fill_bytes(&mut nonce);
+let ciphertext = cipher.encrypt(Nonce::from_slice(&nonce), plaintext)
+.map_err(|_| "Encryption failed".to_string())?;
+Ok((nonce.to_vec(), ciphertext))
+}
+
+fn decrypt(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8])
+-> Result<Vec<u8>, String>
+{
+if nonce.len() != NONCE_LEN {
+return Err("Invalid encryption nonce".into());
+}
+let cipher = ChaCha20Poly1305::new_from_slice(key)
+.map_err(|e| e.to_string())?;
+cipher.decrypt(Nonce::from_slice(nonce), ciphertext)
+.map_err(|_| "Incorrect password/recovery key or damaged vault".into())
+}
+
+fn read_file() -> Result<VaultFile, String> {
+let bytes = fs::read(vault_path()?)
+.map_err(|_| "Vault not found or inaccessible".to_string())?;
+let file: VaultFile = serde_json::from_slice(&bytes)
+.map_err(|_| "Invalid vault file or unsupported vault format".to_string())?;
+if file.version != 2 {
+return Err("Unsupported vault format. Restore your backup.".into());
+}
+Ok(file)
+}
+
+fn write_file(file: &VaultFile) -> Result<(), String> {
+let path = vault_path()?;
+let temp = path.with_extension("tmp");
+let bytes = serde_json::to_vec(file).map_err(|e| e.to_string())?;
+
+let mut output = OpenOptions::new()
+    .write(true).create(true).truncate(true).open(&temp)
+    .map_err(|e| e.to_string())?;
+output.write_all(&bytes).map_err(|e| e.to_string())?;
+output.sync_all().map_err(|e| e.to_string())?;
+drop(output);
+
+fs::rename(&temp, &path).map_err(|e| {
+    let _ = fs::remove_file(&temp);
+    format!("Could not replace vault file: {e}")
+})
+
+}
+
+fn wrap_key(password: &str, salt: &[u8], vault_key: &[u8; 32])
+-> Result<(Vec<u8>, Vec<u8>), String>
+{
+let mut wrapping_key = derive_key(password, salt)?;
+let result = encrypt(&wrapping_key, vault_key);
+wrapping_key.zeroize();
+result
+}
+
+fn unwrap_key(password: &str, salt: &str, nonce: &str, wrapped: &str)
+-> Result<[u8; 32], String>
+{
+let salt = decode(salt)?;
+if salt.len() != SALT_LEN {
+return Err("Invalid key salt".into());
+}
+
+let mut wrapping_key = derive_key(password, &salt)?;
+let nonce = decode(nonce)?;
+let ciphertext = decode(wrapped)?;
+let result = decrypt(&wrapping_key, &nonce, &ciphertext);
+wrapping_key.zeroize();
+
+let mut plaintext = result?;
+if plaintext.len() != 32 {
+    plaintext.zeroize();
+    return Err("Invalid vault key".into());
+}
+
+let mut key = [0u8; 32];
+key.copy_from_slice(&plaintext);
+plaintext.zeroize();
+Ok(key)
+
+}
+
+fn read_entries_with_key(key: &[u8; 32]) -> Result<Vec<Entry>, String> {
+let file = read_file()?;
+let nonce = decode(&file.data_nonce)?;
+let ciphertext = decode(&file.data_ciphertext)?;
+let mut plaintext = decrypt(key, &nonce, &ciphertext)?;
+
+let result = serde_json::from_slice::<VaultData>(&plaintext)
+    .map(|data| data.entries)
+    .map_err(|_| "Invalid vault contents".to_string());
+
+plaintext.zeroize();
+result
+
+}
+
+fn save_entries_with_key(key: &[u8; 32], entries: &[Entry])
+-> Result<(), String>
+{
+let mut file = read_file()?;
+let mut plaintext = serde_json::to_vec(&VaultData {
+entries: entries.to_vec(),
+}).map_err(|e| e.to_string())?;
+
+let result = encrypt(key, &plaintext);
+plaintext.zeroize();
+let (nonce, ciphertext) = result?;
+
+file.data_nonce = encode(&nonce);
+file.data_ciphertext = encode(&ciphertext);
+write_file(&file)
+
+}
+
+pub fn create(password: String) -> Result<String, String> {
+if password.chars().count() < 12 {
+return Err("Use at least 12 characters".into());
+}
+
+let path = vault_path()?;
+if path.exists() {
+    return Err("A vault already exists. Unlock it instead.".into());
+}
+
+let mut vault_key = [0u8; 32];
+let mut master_salt = [0u8; SALT_LEN];
+let mut recovery_salt = [0u8; SALT_LEN];
+OsRng.fill_bytes(&mut vault_key);
+OsRng.fill_bytes(&mut master_salt);
+OsRng.fill_bytes(&mut recovery_salt);
+
+let mut recovery_bytes = [0u8; 32];
+OsRng.fill_bytes(&mut recovery_bytes);
+let recovery_key = encode(&recovery_bytes);
+
+let master_result = wrap_key(&password, &master_salt, &vault_key);
+let recovery_result = wrap_key(&recovery_key, &recovery_salt, &vault_key);
+recovery_bytes.zeroize();
+
+let (master_nonce, master_wrapped_key) = master_result?;
+let (recovery_nonce, recovery_wrapped_key) = recovery_result?;
+let empty = serde_json::to_vec(&VaultData { entries: vec![] })
+    .map_err(|e| e.to_string())?;
+let (data_nonce, data_ciphertext) = encrypt(&vault_key, &empty)?;
+
+let file = VaultFile {
+    version: 2,
+    master_salt: encode(&master_salt),
+    master_nonce: encode(&master_nonce),
+    master_wrapped_key: encode(&master_wrapped_key),
+    recovery_salt: encode(&recovery_salt),
+    recovery_nonce: encode(&recovery_nonce),
+    recovery_wrapped_key: encode(&recovery_wrapped_key),
+    data_nonce: encode(&data_nonce),
+    data_ciphertext: encode(&data_ciphertext),
+};
+
+if let Err(error) = write_file(&file) {
+    vault_key.zeroize();
+    return Err(error);
+}
+
+let mut active = session().lock().map_err(|e| e.to_string())?;
+if let Some(old) = active.as_mut() {
+    old.zeroize();
+}
+*active = Some(vault_key);
+
+Ok(recovery_key)
+
+}
+
+pub fn unlock(password: String) -> Result<Vec<Entry>, String> {
+let file = read_file()?;
+let mut key = unwrap_key(
+&password,
+&file.master_salt,
+&file.master_nonce,
+&file.master_wrapped_key,
+)?;
+
+let entries = match read_entries_with_key(&key) {
+    Ok(entries) => entries,
+    Err(error) => {
+        key.zeroize();
+        return Err(error);
+    }
+};
+
+let mut active = session().lock().map_err(|e| e.to_string())?;
+if let Some(old) = active.as_mut() {
+    old.zeroize();
+}
+*active = Some(key);
+key.zeroize();
+Ok(entries)
+
+}
+
+pub fn recover(recovery_key: String, new_password: String) -> Result<Vec<Entry>, String> {
+if new_password.chars().count() < 12 {
+return Err("Use at least 12 characters for the new master password".into());
+}
+
+let mut file = read_file()?;
+let mut key = unwrap_key(
+    recovery_key.trim(),
+    &file.recovery_salt,
+    &file.recovery_nonce,
+    &file.recovery_wrapped_key,
+)?;
+
+let mut salt = [0u8; SALT_LEN];
+OsRng.fill_bytes(&mut salt);
+let result = wrap_key(&new_password, &salt, &key);
+let (nonce, wrapped) = match result {
+    Ok(value) => value,
+    Err(error) => {
+        key.zeroize();
+        return Err(error);
+    }
+};
+
+file.master_salt = encode(&salt);
+file.master_nonce = encode(&nonce);
+file.master_wrapped_key = encode(&wrapped);
+
+if let Err(error) = write_file(&file) {
+    key.zeroize();
+    return Err(error);
+}
+
+let entries = match read_entries_with_key(&key) {
+    Ok(entries) => entries,
+    Err(error) => {
+        key.zeroize();
+        return Err(error);
+    }
+};
+
+let mut active = session().lock().map_err(|e| e.to_string())?;
+if let Some(old) = active.as_mut() {
+    old.zeroize();
+}
+*active = Some(key);
+key.zeroize();
+Ok(entries)
+
+}
+
+pub fn add_entry(entry: Entry) -> Result<Vec<Entry>, String> {
+let active = session().lock().map_err(|e| e.to_string())?;
+let key = active.as_ref().ok_or("Vault is locked")?;
+let mut entries = read_entries_with_key(key)?;
+entries.push(entry);
+save_entries_with_key(key, &entries)?;
+Ok(entries)
+}
+
+pub fn delete_entry(id: String) -> Result<Vec<Entry>, String> {
+let active = session().lock().map_err(|e| e.to_string())?;
+let key = active.as_ref().ok_or("Vault is locked")?;
+let mut entries = read_entries_with_key(key)?;
+entries.retain(|entry| entry.id != id);
+save_entries_with_key(key, &entries)?;
+Ok(entries)
+}
+
+
+pub fn update_entry(entry: Entry) -> Result<Vec<Entry>, String> {
+    let active = session()
+        .lock()
+        .map_err(|e| e.to_string())?;
+
+    let key = active.as_ref().ok_or("Vault is locked")?;
+    let mut entries = read_entries_with_key(key)?;
+
+    let existing = entries
+        .iter_mut()
+        .find(|item| item.id == entry.id)
+        .ok_or("Password entry not found")?;
+
+    *existing = entry;
+
+    save_entries_with_key(key, &entries)?;
+    Ok(entries)
+}
+
+pub fn lock() -> Result<(), String> {
+let mut active = session().lock().map_err(|e| e.to_string())?;
+if let Some(key) = active.as_mut() {
+key.zeroize();
+}
+*active = None;
+Ok(())
+}
+
+
+
+pub fn delete_vault() -> Result<(), String> {
+    lock()?;
+
+    let path = vault_path()?;
+
+    if !path.exists() {
+        return Err("No vault exists to delete.".into());
+    }
+
+    fs::remove_file(&path)
+        .map_err(|e| format!("Could not delete vault: {e}"))?;
+
+    Ok(())
+}
