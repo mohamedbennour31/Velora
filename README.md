@@ -3,7 +3,8 @@ Velora 🔐
 Your secrets. Your sanctuary.
 
 Velora is a desktop password manager that stores your passwords locally in an encrypted vault, with master-password protection and recovery-key support.
-Features
+
+Features:
 
     🔒 Encrypted local password storage
     🔑 Master password and recovery key
