@@ -1,4 +1,4 @@
-Velora 🔐
+Velora 
 
 Your secrets. Your sanctuary.
 
@@ -6,10 +6,10 @@ Velora is a desktop password manager that stores your passwords locally in an en
 
 Features:
 
-    🔒 Encrypted local password storage
-    🔑 Master password and recovery key
-    🎲 Secure password generator
-    📴 Local-first, offline-focused design
+     Encrypted local password storage
+     Master password and recovery key
+     Secure password generator
+     Local-first, offline-focused design
 
 
 Download link:
